@@ -1,0 +1,26 @@
+# --- Connection settings ---
+oracle:
+  host: "host"
+  port: 0000
+  service_name: "service"
+  user: "user"
+  password: "password"
+  schema: "schema"
+
+postgres:
+  host: "host"
+  port: 0000
+  dbname: "db"
+  user: "user"
+  password: "password"
+  schema: "schema"
+
+# --- Runtime options ---
+# number of chunks to split each table for checksum comparison
+default_chunks: 100
+
+# If your Oracle DATE should be interpreted as UTC, set this true (affects only docs; normalization is string-based)
+assume_utc: true
+
+# Output folder for CSV reports (relative to where you run recon_run.py)
+output_dir: "./recon_out"

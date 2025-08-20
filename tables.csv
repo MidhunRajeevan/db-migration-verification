@@ -1,0 +1,4 @@
+# ora_schema,ora_table,pg_schema,pg_table,pk_column,chunks
+APP,ORDERS,public,orders,order_id,100
+APP,CUSTOMERS,public,customers,customer_id,100
+# Add more lines as needed
