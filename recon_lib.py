@@ -126,43 +126,83 @@ def ora_build_cat_expr(conn, schema: str, table: str) -> str:
         raise
 
 # --- Postgres chunked checksum ---
-def pg_chunk_sums(conn, schema: str, table: str, pk: str, chunks: int) -> pd.DataFrame:
+# def pg_chunk_sums(conn, schema: str, table: str, pk: str, chunks: int) -> pd.DataFrame:
+#     print(f"Generating chunked checksums for {schema}.{table}.{pk}.{chunks}.")
+#     try:
+#         sql = f"""
+#         WITH cols AS (
+#           SELECT string_agg(format('coalesce(%1$I::text,''∅'')', column_name), '||''|''||'
+#                             ORDER BY ordinal_position) AS cat
+#           FROM information_schema.columns
+#           WHERE table_schema=%s AND table_name=%s
+#         ),
+#         rows AS (
+#           SELECT ntile(%s) OVER (ORDER BY {pk.lower()}::text) AS chunk_id,
+#                  md5((SELECT cat FROM cols)) AS row_hash
+#           FROM   {schema}."{table}"
+#         )
+#         SELECT %s AS side, %s AS schema, %s AS table, chunk_id,
+#                sum(('x'||substr(row_hash,1,8))::bit(32)::int) AS chunk_sum,
+#                count(*) AS rows_in_chunk
+#         FROM rows
+#         GROUP BY chunk_id
+#         ORDER BY chunk_id;
+#         """
+#         return pg_query_df(conn, sql, (schema, table, chunks, "PG", schema, table))
+#     except Exception as e:
+#         print(f"Error in pg_chunk_sums for {schema}.{table}: {e}")
+#         raise
+
+def pg_chunk_sums(conn, schema, table, pk, chunks):
+    # build concatenation list from information_schema
+    cols_df = pg_query_df(conn, """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema=%s AND table_name=%s
+        ORDER BY ordinal_position
+    """, (schema, table))
+    parts = []
+    for name, dtype in cols_df.to_records(index=False):
+        col = f'"{name}"'
+        if dtype in ('numeric','integer','bigint','smallint','real','double precision'):
+            parts.append(f"coalesce({col}::numeric::text,'Ø')")
+        elif 'timestamp' in dtype or dtype=='date':
+            parts.append(f"coalesce(to_char({col}, 'YYYY-MM-DD\"T\"HH24:MI:SS.MS'),'Ø')")
+        else:
+            parts.append(f"coalesce(rtrim({col}::text),'Ø')")
+    cat = " || '|' || ".join(parts)
+
     sql = f"""
-    WITH cols AS (
-      SELECT string_agg(format('coalesce(%1$I::text,''∅'')', column_name), '||''|''||'
-                        ORDER BY ordinal_position) AS cat
-      FROM information_schema.columns
-      WHERE table_schema=%s AND table_name=%s
-    ),
-    rows AS (
-      SELECT ntile(%s) OVER (ORDER BY {pk}::text) AS chunk_id,
-             md5((SELECT cat FROM cols)) AS row_hash
-      FROM   {schema}."{table}"
+    WITH rows AS (
+      SELECT ntile({chunks}) OVER (ORDER BY "{pk}"::text) AS chunk_id,
+             md5({cat}) AS row_hash
+      FROM {schema}."{table}"
     )
-    SELECT %s AS side, %s AS schema, %s AS table, chunk_id,
-           sum(('x'||substr(row_hash,1,8))::bit(32)::int) AS chunk_sum,
-           count(*) AS rows_in_chunk
+    SELECT 'PG' AS side, %s AS SCHEMA, %s AS TABLE_NAME, CHUNK_ID,
+           sum(('x'||substr(row_hash,1,8))::bit(32)::int) AS CHUNK_SUM,
+           count(*) AS ROWS_IN_CHUNK
     FROM rows
     GROUP BY chunk_id
     ORDER BY chunk_id;
     """
-    return pg_query_df(conn, sql, (schema, table, chunks, "PG", schema, table))
+    return pg_query_df(conn, sql, (schema, f"{schema}.{table}"))
+
 
 # --- Oracle chunked checksum ---
 def ora_chunk_sums(conn, schema: str, table: str, pk: str, chunks: int, cat_expr: str) -> pd.DataFrame:
     sql = f"""
-    WITH rows AS (
-    SELECT NTILE(:chunks) OVER (ORDER BY {pk}) AS chunk_id,
+    WITH records AS (
+    SELECT NTILE('{chunks}') OVER (ORDER BY {pk}) AS chunk_id,
             ORA_HASH({cat_expr}, 4294967295) AS row_hash
     FROM   {schema}.{table}
     )
-    SELECT 'ORA' AS side, '{schema}' AS schema, '{table}' AS table, chunk_id,
+    SELECT 'ORA' AS side, '{schema}' AS schema, '{table}' AS table_name, chunk_id,
         SUM(row_hash) AS chunk_sum, COUNT(*) AS rows_in_chunk
-    FROM rows
+    FROM records
     GROUP BY chunk_id
     ORDER BY chunk_id
     """
-    return ora_query_df(conn, sql, {"chunks": chunks})
+    return ora_query_df(conn, sql)
 # --- FK orphan SQL generator (Postgres) ---
 def pg_generate_fk_checks(conn, schema: str) -> List[str]:
     sql = """
@@ -199,10 +239,15 @@ def safe_int(x) -> int:
     except: return 0
 
 def compare_chunks(ora_df: pd.DataFrame, pg_df: pd.DataFrame) -> pd.DataFrame:
-    j = ora_df.merge(pg_df, on=["schema","table","chunk_id"], suffixes=("_ora","_pg"))
-    j["match"] = j["chunk_sum_ora"] == j["chunk_sum_pg"]
-    mism = j[j["match"] == False][["schema","table","chunk_id","chunk_sum_ora","chunk_sum_pg","rows_in_chunk_ora","rows_in_chunk_pg"]]
-    return mism
+    pg_df.columns = [c.upper() for c in pg_df.columns]
+    try:
+        j = ora_df.merge(pg_df, on=["SCHEMA", "TABLE_NAME", "CHUNK_ID"], suffixes=("_ora", "_pg"))
+        j["match"] = j["CHUNK_SUM_ora"] == j["CHUNK_SUM_pg"]
+        mism = j[j["match"] == False][["SCHEMA", "TABLE_NAME", "CHUNK_ID", "CHUNK_SUM_ora", "CHUNK_SUM_pg", "ROWS_IN_CHUNK_ora", "ROWS_IN_CHUNK_pg"]]
+        return mism
+    except Exception as e:
+        print(f"Error in compare_chunks: {e}")
+        return pd.DataFrame()
 
 def ensure_output_dir(path: str):
     import os

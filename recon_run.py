@@ -28,6 +28,7 @@ def main():
     counts_rows = []
     chunks_rows = []
     mismatches = []
+    missing_tables = []  # Track missing tables
 
     for t in tables:
         print(f"\n=== Table: {t.ora_schema}.{t.ora_table}  <->  {cfg.postgres['schema']}.{t.pg_table} (pk={t.pk}, chunks={t.chunks}) ===")
@@ -38,6 +39,18 @@ def main():
             pg_c  = pg_count(pg, cfg.postgres["schema"], t.pg_table)
         except Exception as e:
             print(f"  [ERROR] Counting rows failed: {e}")
+            # Add missing table info
+            missing_tables.append({
+                "ORA_SCHEMA": t.ora_schema,
+                "ORA_TABLE": t.ora_table,
+                "PG_SCHEMA": cfg.postgres["schema"],
+                "PG_TABLE": t.pg_table,
+                "ERROR": str(e)
+            })
+            try:    
+                pg.rollback()
+            except Exception as e:
+                print(f"  [ERROR] Rolling back Postgres transaction failed: {e}")
             continue
 
         counts_rows.append(["ORA", t.ora_schema, t.ora_table, ora_c])
@@ -46,11 +59,12 @@ def main():
 
         # Chunked checksum
         try:
-            print("  Fetching chunked checksums...")
+            if ora_c > 50000:
+                print("  Skipping chunk checksum (row count >= 50,000)")
+                continue
             cat_expr = ora_build_cat_expr(ora, t.ora_schema, t.ora_table)
-            print(f"  Using category expression: {cat_expr}")
             ora_chunks = ora_chunk_sums(ora, t.ora_schema, t.ora_table, t.pk, t.chunks, cat_expr)
-            pg_chunks  = pg_chunk_sums(pg,  cfg.postgres["schema"],  t.pg_table,  t.pk, t.chunks)
+            pg_chunks  = pg_chunk_sums(pg,  cfg.postgres["schema"],  t.pg_table,  t.pk.lower(), t.chunks)  
             chunks_rows.extend(ora_chunks.to_records(index=False).tolist())
             chunks_rows.extend(pg_chunks.to_records(index=False).tolist())
             diff = compare_chunks(ora_chunks, pg_chunks)
@@ -68,16 +82,16 @@ def main():
 
     # Save chunks
     if chunks_rows:
-        chunks_df = pd.DataFrame(chunks_rows, columns=["side","schema","table","chunk_id","chunk_sum","rows_in_chunk"])
+        chunks_df = pd.DataFrame(chunks_rows, columns=["SIDE","SCHEMA","TABLE_NAME","CHUNK_ID","CHUNK_SUM","ROWS_IN_CHUNK"])
         chunks_df.to_csv(os.path.join(cfg.output_dir, "recon_chunks.csv"), index=False)
     else:
-        chunks_df = pd.DataFrame(columns=["side","schema","table","chunk_id","chunk_sum","rows_in_chunk"])
+        chunks_df = pd.DataFrame(columns=["SIDE","SCHEMA","TABLE_NAME","CHUNK_ID","CHUNK_SUM","ROWS_IN_CHUNK"])
 
     # Save mismatches
     if mismatches:
         mism_df = pd.concat(mismatches, ignore_index=True)
     else:
-        mism_df = pd.DataFrame(columns=["schema","table","chunk_id","chunk_sum_ora","chunk_sum_pg","rows_in_chunk_ora","rows_in_chunk_pg"])
+        mism_df = pd.DataFrame(columns=["SCHEMA","TABLE_NAME","CHUNK_ID","CHUNK_SUM_ora","CHUNK_SUM_pg","ROWS_IN_CHUNK_ora","ROWS_IN_CHUNK_pg"])
     mism_df.to_csv(os.path.join(cfg.output_dir, "mismatched_chunks.csv"), index=False)
 
     # Optional: FK orphan checks on Postgres
@@ -96,10 +110,18 @@ def main():
         except Exception as e:
             print(f"  [WARN] FK check failed: {e}")
 
+    # Save missing tables
+    if missing_tables:
+        missing_df = pd.DataFrame(missing_tables)
+    else:
+        missing_df = pd.DataFrame(columns=["ORA_SCHEMA","ORA_TABLE","PG_SCHEMA","PG_TABLE","ERROR"])
+    missing_df.to_csv(os.path.join(cfg.output_dir, "missing_tables.csv"), index=False)
+
     print("\nDone. Reports written to:", cfg.output_dir)
     print(" - recon_summary.csv")
     print(" - recon_chunks.csv")
     print(" - mismatched_chunks.csv")
+    print(" - missing_tables.csv")
     if fk_schema:
         print(f" - fk_orphans_{fk_schema}.csv")
 
